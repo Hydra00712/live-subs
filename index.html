@@ -167,7 +167,11 @@ async function groq(path, init){
     let detail = ''; try { detail = (await r.json()).error?.message || ''; } catch {}
     if (r.status === 401) throw new Error('Your Groq API key is wrong. Tap "change" and paste it again.');
     if (r.status === 413) throw new Error('This video is too long for one go. Try a shorter one.');
-    if (r.status === 429) throw new Error('Groq free limit reached for now. Wait a bit and try again. ' + detail);
+    if (r.status === 429) {
+      const m = /try again in (?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?/i.exec(detail) || [];
+      const wait = (+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0) || 60;
+      const e = new Error('rate-limit'); e.status = 429; e.wait = Math.ceil(wait) + 2; throw e;
+    }
     const e = new Error('Groq error ' + r.status + (detail ? ': ' + detail : '')); e.status = r.status; throw e;
   }
   return r.json();
@@ -275,18 +279,54 @@ function wav(samples, rate){
 const JUNK = [/^[\s.,!?¡¿…-]*$/, /amara\.org/i, /suscr[ií]b/i, /subt[ií]tul/i, /thank(s| you) for watching/i, /gracias por ver/i];
 const isJunk = t => JUNK.some(r => r.test(t));
 
+// Each Whisper model has its own free hourly allowance, so fall back to turbo when large-v3 is used up.
 async function transcribe(piece){
-  const fd = new FormData();
-  fd.append('file', piece.blob, piece.name);
-  fd.append('model', 'whisper-large-v3');
-  fd.append('language', 'es');
-  fd.append('response_format', 'verbose_json');
-  fd.append('timestamp_granularities[]', 'word');
-  fd.append('timestamp_granularities[]', 'segment');
-  fd.append('temperature', '0');
-  const j = await groq('audio/transcriptions', { method: 'POST', headers: { Authorization: 'Bearer ' + apiKey }, body: fd });
+  const call = model => {
+    const fd = new FormData();
+    fd.append('file', piece.blob, piece.name);
+    fd.append('model', model);
+    fd.append('language', 'es');
+    fd.append('response_format', 'verbose_json');
+    fd.append('timestamp_granularities[]', 'word');
+    fd.append('timestamp_granularities[]', 'segment');
+    fd.append('temperature', '0');
+    return groq('audio/transcriptions', { method: 'POST', headers: { Authorization: 'Bearer ' + apiKey }, body: fd });
+  };
+  let j;
+  try { j = await call('whisper-large-v3'); }
+  catch (e) {
+    if (e.status !== 429) throw e;
+    try { j = await call('whisper-large-v3-turbo'); }
+    catch (e2) { if (e2.status === 429) e2.wait = Math.min(e.wait, e2.wait); throw e2; }
+  }
   return { j, offset: piece.offset };
 }
+
+// Wait out a rate limit with a visible countdown, then let the caller retry.
+async function waitForLimit(sec){
+  const end = Date.now() + sec * 1000;
+  while (Date.now() < end) {
+    const left = Math.ceil((end - Date.now()) / 1000);
+    showErr('Groq\'s free hourly limit is used up. Continuing automatically in ' + Math.floor(left / 60) + ':' + String(left % 60).padStart(2, '0') + '. Keep this page open.');
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  showErr('');
+}
+async function withRetry(fn){
+  for (;;) {
+    try { return await fn(); }
+    catch (e) { if (e.status !== 429) throw e; await waitForLimit(e.wait); }
+  }
+}
+
+// Remember finished subtitles per video, so re-opening the same video costs nothing.
+const fileSig = f => 'sm_cues_' + f.name + '|' + f.size + '|' + f.lastModified;
+function loadCached(f){ try { return JSON.parse(localStorage.getItem(fileSig(f)) || 'null'); } catch { return null; } }
+function saveCached(f, c){
+  try { localStorage.setItem(fileSig(f), JSON.stringify(c)); }
+  catch { try { Object.keys(localStorage).filter(k => k.startsWith('sm_cues_')).forEach(k => localStorage.removeItem(k)); localStorage.setItem(fileSig(f), JSON.stringify(c)); } catch {} }
+}
+const pieceCache = new Map(); // sig#index -> transcription, survives a retry in the same session
 
 function buildCues({ j, offset }){
   const all = j.segments || [];
@@ -318,15 +358,25 @@ function buildCues({ j, offset }){
       const gap = nxt ? nxt.start - w.end : 0;
       const dur = w.end - cur[0].start;
       if (!nxt) return;
-      if (text.length > 80 || dur > 6 || gap > 0.7 || (/[.?!…]$/.test(w.word.trim()) && text.length > 18)) flush();
+      if (text.length > 80 || dur > 6 || gap > 1.0 || (/[.?!…]$/.test(w.word.trim()) && text.length > 18)) flush();
     });
     flush();
   }
   return cues;
 }
 
-function tidyCues(cues){
-  cues.sort((a, b) => a.start - b.start);
+function tidyCues(input){
+  input.sort((a, b) => a.start - b.start);
+  // glue tiny fragments ("Hoy", "¿Están") onto their neighbour so lines read as sentences
+  const tiny = c => c.es.split(/\s+/).length <= 2 && !/[.?!…]$/.test(c.es);
+  const cues = [];
+  for (const c of input) {
+    const prev = cues[cues.length - 1];
+    const shortTail = prev && c.es.split(/\s+/).length <= 2 && !/[.?!…]$/.test(prev.es);
+    if (prev && (tiny(prev) || tiny(c) || shortTail) && c.start - prev.end < 1.0 && (prev.es + ' ' + c.es).length <= 90 && c.end - prev.start <= 7) {
+      prev.es += ' ' + c.es; prev.end = c.end;
+    } else cues.push({ ...c });
+  }
   for (let i = 0; i < cues.length; i++) {
     const c = cues[i], next = cues[i + 1];
     c.end = Math.max(c.end, c.start + Math.min(1.2, 0.35 + c.es.length * 0.05)); // readable minimum
@@ -354,10 +404,10 @@ async function translateBatch(lines, context){
   };
   try { return await run('openai/gpt-oss-120b'); }
   catch (e) {
-    if (/key is wrong|free limit/.test(e.message)) throw e;
+    if (/key is wrong/.test(e.message)) throw e;
     try { return await run('openai/gpt-oss-20b'); }
     catch (e2) {
-      if (/key is wrong|free limit/.test(e2.message)) throw e2;
+      if (/key is wrong/.test(e2.message) || e2.status === 429) throw e2;
       if (lines.length === 1) return [lines[0]]; // give up on this one line: show Spanish
       const h = Math.ceil(lines.length / 2);
       return [...await translateBatch(lines.slice(0, h), context), ...await translateBatch(lines.slice(h), lines.slice(Math.max(0, h - 3), h))];
@@ -370,7 +420,7 @@ async function translateAll(cues){
   let done = 0;
   await pool(batches, 3, async i => {
     const slice = cues.slice(i, i + B);
-    const en = await translateBatch(slice.map(c => c.es), cues.slice(Math.max(0, i - 3), i).map(c => c.es));
+    const en = await withRetry(() => translateBatch(slice.map(c => c.es), cues.slice(Math.max(0, i - 3), i).map(c => c.es)));
     slice.forEach((c, k) => c.en = en[k]);
     prog(++done / batches.length);
   });
@@ -431,16 +481,27 @@ $('file').addEventListener('change', async e => {
   $('pickLabel').style.opacity = .5;
   $('result').hidden = true; $('progCard').hidden = false;
   try {
-    step('audio'); prog(0);
-    const pieces = await extractAudio(f);
-    step('stt'); prog(0.1);
-    let n = 0;
-    const results = await pool(pieces, 3, async p => { const r = await transcribe(p); prog(0.1 + 0.9 * (++n / pieces.length)); return r; });
-    cues = tidyCues(results.flatMap(buildCues));
-    if (!cues.length) throw new Error("Didn't hear any speech in this video.");
-    step('tr'); prog(0);
-    await translateAll(cues);
-    step('done'); prog(1);
+    const cached = loadCached(f);
+    if (cached && cached.length && cached.every(c => typeof c.en === 'string')) {
+      cues = cached; step('done'); prog(1);
+    } else {
+      step('audio'); prog(0);
+      const pieces = await extractAudio(f);
+      step('stt'); prog(0.1);
+      let n = 0;
+      const results = await pool(pieces, 2, async (p, i) => {
+        const k = fileSig(f) + '#' + i;
+        if (!pieceCache.has(k)) pieceCache.set(k, await withRetry(() => transcribe(p)));
+        prog(0.1 + 0.9 * (++n / pieces.length));
+        return pieceCache.get(k);
+      });
+      cues = tidyCues(results.flatMap(buildCues));
+      if (!cues.length) throw new Error("Didn't hear any speech in this video.");
+      step('tr'); prog(0);
+      await translateAll(cues);
+      step('done'); prog(1);
+      saveCached(f, cues);
+    }
     if (fileUrl) URL.revokeObjectURL(fileUrl);
     fileUrl = URL.createObjectURL(f);
     $('player').src = fileUrl;
