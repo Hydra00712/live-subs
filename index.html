@@ -218,7 +218,9 @@ function aacDescription(mp4, trackId){
   } catch { return undefined; }
 }
 
-// Returns [{blob, name, offset}] pieces, each small enough for Groq.
+// Reads the video's sound once and returns a source that can cut a piece starting at any time.
+// Pieces are cut on demand so each one can start in a pause found in the previous piece's words.
+const MAX_PIECE_BYTES = 17 * 1024 * 1024, MAX_PIECE_SEC = 20 * 60;
 async function extractAudio(file){
   try {
     let at = null; const samples = [];
@@ -227,31 +229,36 @@ async function extractAudio(file){
       (_id, ss) => { for (const s of ss) samples.push({ data: new Uint8Array(s.data), cts: s.cts / s.timescale, dur: s.duration / s.timescale }); },
       p => prog(p * 0.9));
     if (!at.codec.startsWith('mp4a')) throw new Error('not-aac');
+    if (!samples.length) throw new Error('This video has no sound.');
     const desc = aacDescription(mp4, at.id);
-    const pieces = []; let i = 0;
-    const MAX_BYTES = 17 * 1024 * 1024, MAX_SEC = 20 * 60;
-    while (i < samples.length) {
-      const muxer = new Mp4Muxer.Muxer({ target: new Mp4Muxer.ArrayBufferTarget(), fastStart: 'in-memory', firstTimestampBehavior: 'offset',
-        audio: { codec: 'aac', numberOfChannels: at.audio.channel_count, sampleRate: at.audio.sample_rate } });
-      const start = samples[i].cts; let bytes = 0, first = true;
-      while (i < samples.length && bytes < MAX_BYTES && samples[i].cts - start < MAX_SEC) {
-        const s = samples[i++]; bytes += s.data.length;
-        muxer.addAudioChunkRaw(s.data, 'key', s.cts * 1e6, s.dur * 1e6,
-          first && desc ? { decoderConfig: { codec: 'mp4a.40.2', numberOfChannels: at.audio.channel_count, sampleRate: at.audio.sample_rate, description: desc } } : undefined);
-        first = false;
-      }
-      muxer.finalize();
-      pieces.push({ blob: new Blob([muxer.target.buffer], { type: 'audio/mp4' }), name: 'audio.m4a', offset: start });
-    }
+    const lastS = samples[samples.length - 1], duration = lastS.cts + lastS.dur;
     prog(1);
-    return pieces;
+    return {
+      duration,
+      make(startSec, maxSec = MAX_PIECE_SEC){
+        let lo = 0, hi = samples.length - 1;               // first sample at/after startSec
+        while (lo < hi) { const mid = (lo + hi) >> 1; if (samples[mid].cts < startSec - 1e-3) lo = mid + 1; else hi = mid; }
+        const muxer = new Mp4Muxer.Muxer({ target: new Mp4Muxer.ArrayBufferTarget(), fastStart: 'in-memory', firstTimestampBehavior: 'offset',
+          audio: { codec: 'aac', numberOfChannels: at.audio.channel_count, sampleRate: at.audio.sample_rate } });
+        let i = lo, bytes = 0, first = true; const start = samples[lo].cts;
+        while (i < samples.length && bytes < MAX_PIECE_BYTES && samples[i].cts - start < maxSec) {
+          const s = samples[i++]; bytes += s.data.length;
+          muxer.addAudioChunkRaw(s.data, 'key', s.cts * 1e6, s.dur * 1e6,
+            first && desc ? { decoderConfig: { codec: 'mp4a.40.2', numberOfChannels: at.audio.channel_count, sampleRate: at.audio.sample_rate, description: desc } } : undefined);
+          first = false;
+        }
+        muxer.finalize();
+        const last = i >= samples.length, end = last ? duration : samples[i].cts;
+        return { blob: new Blob([muxer.target.buffer], { type: 'audio/mp4' }), name: 'audio.m4a', offset: start, dur: end - start, last };
+      }
+    };
   } catch (e) {
     if (e && e.message === 'This video has no sound.') throw e;
     return extractAudioDecode(file); // webm, non-AAC, or anything mp4box can't read
   }
 }
 
-// Fallback: let the browser decode the audio, then make 16 kHz WAV pieces.
+// Fallback: let the browser decode the audio, then cut 16 kHz WAV pieces.
 async function extractAudioDecode(file){
   const ab = await file.arrayBuffer();
   const ctx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, 16000, 16000);
@@ -260,10 +267,15 @@ async function extractAudioDecode(file){
   catch { throw new Error("Couldn't read the sound from this video. Try another file (MP4 or MOV works best)."); }
   const n = buf.length, mono = new Float32Array(n);
   for (let c = 0; c < buf.numberOfChannels; c++) { const d = buf.getChannelData(c); for (let i = 0; i < n; i++) mono[i] += d[i] / buf.numberOfChannels; }
-  const rate = buf.sampleRate, per = rate * 60 * 9, pieces = [];
-  for (let s = 0; s < n; s += per) pieces.push({ blob: wav(mono.subarray(s, Math.min(n, s + per)), rate), name: 'audio.wav', offset: s / rate });
+  const rate = buf.sampleRate, per = Math.floor(rate * Math.min(MAX_PIECE_SEC, 9 * 60));
   prog(1);
-  return pieces;
+  return {
+    duration: n / rate,
+    make(startSec, maxSec = MAX_PIECE_SEC){
+      const s = Math.min(n - 1, Math.max(0, Math.round(startSec * rate))), e = Math.min(n, s + Math.min(per, Math.floor(maxSec * rate)));
+      return { blob: wav(mono.subarray(s, e), rate), name: 'audio.wav', offset: s / rate, dur: (e - s) / rate, last: e >= n };
+    }
+  };
 }
 function wav(samples, rate){
   const b = new ArrayBuffer(44 + samples.length * 2), v = new DataView(b);
@@ -299,7 +311,7 @@ async function transcribe(piece){
     try { j = await call('whisper-large-v3-turbo'); }
     catch (e2) { if (e2.status === 429) e2.wait = Math.min(e.wait, e2.wait); throw e2; }
   }
-  return { j, offset: piece.offset };
+  return { j, offset: piece.offset, dur: piece.dur };
 }
 
 // Wait out a rate limit with a visible countdown, then let the caller retry.
@@ -320,7 +332,7 @@ async function withRetry(fn){
 }
 
 // Remember finished subtitles per video, so re-opening the same video costs nothing.
-const fileSig = f => 'sm_cues_' + f.name + '|' + f.size + '|' + f.lastModified;
+const fileSig = f => 'sm_cues_v2_' + f.name + '|' + f.size + '|' + f.lastModified;
 function loadCached(f){ try { return JSON.parse(localStorage.getItem(fileSig(f)) || 'null'); } catch { return null; } }
 function saveCached(f, c){
   try { localStorage.setItem(fileSig(f), JSON.stringify(c)); }
@@ -328,23 +340,60 @@ function saveCached(f, c){
 }
 const pieceCache = new Map(); // sig#index -> transcription, survives a retry in the same session
 
-function buildCues({ j, offset }){
+// Where to end a (non-final) piece: just after a word that is followed by a pause, at least 5 s before
+// the piece's own cut, so nothing Whisper may have garbled at the very end is used. The next piece
+// starts at that pause, so it never starts in the middle of a word.
+function chooseCut({ j, offset, dur }, from){
+  const end = offset + dur, limit = end - 5;
+  const words = (j.words || []).filter(w => (w.word || '').trim()).map(w => ({ s: w.start + offset, e: w.end + offset, t: w.word.trim() }));
+  let best = null, bestScore = -1;
+  for (let i = 0; i < words.length - 1; i++) {
+    const w = words[i], gap = words[i + 1].s - w.e;
+    if (w.e > limit || w.s < from || gap < 0.2) continue;
+    // prefer late cuts, sentence ends and longer pauses
+    const score = (w.e - offset) + (/[.?!…]$/.test(w.t) ? 30 : 0) + Math.min(gap, 2) * 10;
+    if (score >= bestScore) { bestScore = score; best = w.e + Math.min(0.12, gap / 2); }
+  }
+  if (best === null || best < from + Math.min(30, dur / 3)) best = Math.max(from + 1, limit);
+  return best;
+}
+
+// Stretches of 3-35 s inside [from, to) where Whisper returned no words.
+function findGaps({ r, from, to }){
+  const ws = (r.j.words || []).filter(w => (w.word || '').trim())
+    .map(w => ({ s: w.start + r.offset, e: w.end + r.offset })).filter(w => w.s >= from && w.s < to);
+  const out = []; let prevEnd = from;
+  for (const w of ws) {
+    if (w.s - prevEnd >= 3 && w.s - prevEnd <= 35) out.push([prevEnd + 0.05, w.s]);
+    prevEnd = Math.max(prevEnd, w.e);
+  }
+  if (to - prevEnd >= 3 && to - prevEnd <= 35) out.push([prevEnd + 0.05, to]);
+  return out;
+}
+
+// Keep this piece's words that start in [from, to) and turn them into subtitle lines.
+function buildCues({ j, offset }, from = -Infinity, to = Infinity){
   const all = j.segments || [];
   const keep = s => { const t = (s.text || '').trim(); return t && !isJunk(t) && !(s.no_speech_prob > 0.6 && s.avg_logprob < -0.7); };
+  const hasWords = (j.words || []).length > 0;
+  const mine = t => t + offset >= from && t + offset < to;
   // give every word to the segment it starts in (word end times can run past the segment end)
   const bySeg = all.map(() => []);
   let si = 0;
   for (const w of (j.words || [])) {
     if (!(w.word || '').trim() || !all.length) continue;
     while (si < all.length - 1 && w.start >= all[si + 1].start - 0.05) si++;
-    bySeg[si].push(w);
+    if (mine(w.start)) bySeg[si].push(w);
   }
   const cues = [];
   for (let k = 0; k < all.length; k++) {
     const s = all[k];
     if (!keep(s)) continue;
     const ws = bySeg[k];
-    if (!ws.length) { cues.push({ start: s.start + offset, end: s.end + offset, es: s.text.trim() }); continue; }
+    if (!ws.length) {
+      if (!hasWords && mine((s.start + s.end) / 2)) cues.push({ start: s.start + offset, end: s.end + offset, es: s.text.trim() });
+      continue;
+    }
     let cur = [];
     const flush = () => {
       if (!cur.length) return;
@@ -486,16 +535,36 @@ $('file').addEventListener('change', async e => {
       cues = cached; step('done'); prog(1);
     } else {
       step('audio'); prog(0);
-      const pieces = await extractAudio(f);
-      step('stt'); prog(0.1);
-      let n = 0;
-      const results = await pool(pieces, 2, async (p, i) => {
-        const k = fileSig(f) + '#' + i;
-        if (!pieceCache.has(k)) pieceCache.set(k, await withRetry(() => transcribe(p)));
-        prog(0.1 + 0.9 * (++n / pieces.length));
-        return pieceCache.get(k);
+      const src = await extractAudio(f);
+      step('stt'); prog(0);
+      // one piece at a time: each next piece starts in a pause found in the previous one
+      const all = [], windows = []; let start = 0;
+      for (;;) {
+        const k = fileSig(f) + '@' + start.toFixed(3);
+        let entry = pieceCache.get(k);
+        if (!entry) {
+          const piece = src.make(start);
+          const r = await withRetry(() => transcribe(piece));
+          entry = { r, last: piece.last, cut: piece.last ? Infinity : chooseCut(r, start) };
+          pieceCache.set(k, entry);
+        }
+        all.push(...buildCues(entry.r, start, entry.cut));
+        windows.push({ r: entry.r, from: start, to: entry.last ? src.duration : entry.cut });
+        if (entry.last) break;
+        start = entry.cut;
+        prog(0.85 * start / src.duration);
+      }
+      // Whisper sometimes stops early and skips the rest of a 30 s window. Re-listen to every
+      // silent stretch of 3-35 s (starting in the pause) so skipped speech is recovered.
+      const gaps = windows.flatMap(findGaps).slice(0, 40);
+      let g = 0;
+      await pool(gaps, 2, async ([g0, g1]) => {
+        const k = fileSig(f) + '#gap' + g0.toFixed(3);
+        if (!pieceCache.has(k)) pieceCache.set(k, await withRetry(() => transcribe(src.make(g0, g1 - g0 + 1))));
+        all.push(...buildCues(pieceCache.get(k), g0, g1));
+        prog(0.85 + 0.15 * (++g / gaps.length));
       });
-      cues = tidyCues(results.flatMap(buildCues));
+      cues = tidyCues(all);
       if (!cues.length) throw new Error("Didn't hear any speech in this video.");
       step('tr'); prog(0);
       await translateAll(cues);
@@ -583,7 +652,8 @@ function videoDescription(mp4, trackId){
 const tick = () => new Promise(r => setTimeout(r, 1));
 
 async function pickEncoder(W, H, fps){
-  const bitrate = Math.round(Math.min(14e6, Math.max(2.5e6, W * H * fps * 0.11)));
+  // ~4 Mbps for 1080p30, ~2 Mbps for 720p30: sharp enough, and small enough to fit in phone memory
+  const bitrate = Math.round(Math.min(8e6, Math.max(0.8e6, W * H * fps * 0.065)));
   const codecs = W * H > 1920 * 1088 ? ['avc1.640033', 'avc1.4d0033'] : ['avc1.640028', 'avc1.4d0028', 'avc1.42002a', 'avc1.42001f'];
   for (const codec of codecs) {
     for (const hw of ['prefer-hardware', 'no-preference']) {
@@ -606,7 +676,9 @@ async function exportFast(){
     rot = (Math.round(Math.atan2(m[1], m[0]) * 180 / Math.PI) + 360) % 360;
     const srcW = vt.video.width, srcH = vt.video.height;
     const dw = rot % 180 ? srcH : srcW, dh = rot % 180 ? srcW : srcH;
-    const k = Math.min(1, 1920 / Math.max(dw, dh));
+    // long videos are saved at 720p so the finished file stays small enough for a phone to hold
+    const maxSide = vt.duration / vt.timescale > 300 ? 1280 : 1920;
+    const k = Math.min(1, maxSide / Math.max(dw, dh));
     W = Math.round(dw * k / 2) * 2; H = Math.round(dh * k / 2) * 2;
     const fps = Math.min(60, Math.max(1, Math.round(vt.nb_samples / (vt.duration / vt.timescale)) || 30));
     keyEvery = fps * 2; total = vt.nb_samples;
