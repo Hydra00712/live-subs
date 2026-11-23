@@ -97,7 +97,7 @@
     </div>
     <div class="field">
       <div class="row"><label for="showEs">Also show the Spanish</label><input id="showEs" type="checkbox"></div>
-      <small>Shows the original Spanish under the English. Handy for learning, but uses twice as many requests.</small>
+      <small>Shows the original Spanish under the English. Handy for learning.</small>
     </div>
     <div class="field">
       <label for="size">Text size: <span id="sizeVal"></span>px</label>
@@ -121,7 +121,6 @@
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
-  const API = 'https://api.groq.com/openai/v1/audio/';
   const TARGET_SR = 16000;
 
   // ---------- settings (per-phone, browser storage) ----------
@@ -199,8 +198,10 @@
     /^[\s.,!?¡¿…-]*$/,
     /thank(s| you) (so much )?for watching/i,
     /(please )?(like and )?subscribe/i,
-    /subtit(les|ulos)? (by|made|realizados|por)/i,
+    /subt[ií]t(les|ulos?)\b.*\b(by|made|realizados|por)\b/i,
     /amara\.org/i,
+    /suscr[ií]be(te)?/i,
+    /gracias por (ver|su atenci[oó]n)/i,
     /^\W*(you|bye|thank you|thanks|okay|oh|music|applause|\[music\]|\(music\))\W*$/i,
     /^(gracias\.?|¡?gracias por ver!?)$/i,
   ];
@@ -220,21 +221,42 @@
   }
 
   // ---------- Groq calls ----------
+  // Step 1: Whisper writes down the Spanish. Step 2: a fast LLM translates it to English.
+  // (Groq's Whisper "translations" endpoint was tested and returned Spanish, so it isn't used.)
   let backoffUntil = 0;
-  async function callGroq(kind, wav){
-    const fd = new FormData();
-    fd.append('file', wav, 'clip.wav');
-    fd.append('model', kind === 'translations' ? 'whisper-large-v3' : 'whisper-large-v3-turbo');
-    fd.append('response_format', 'verbose_json');
-    fd.append('temperature', '0');
-    if (kind === 'transcriptions') fd.append('language', 'es');
-    const r = await fetch(API + kind, { method: 'POST', headers: { Authorization: 'Bearer ' + cfg.key }, body: fd });
+  async function groqFetch(path, init){
+    const r = await fetch('https://api.groq.com/openai/v1/' + path, init);
     if (!r.ok) {
       const err = new Error('HTTP ' + r.status); err.status = r.status;
       try { err.detail = (await r.json()).error?.message; } catch {}
       throw err;
     }
     return r.json();
+  }
+  function transcribe(wav){
+    const fd = new FormData();
+    fd.append('file', wav, 'clip.wav');
+    fd.append('model', 'whisper-large-v3');
+    fd.append('language', 'es');
+    fd.append('response_format', 'verbose_json');
+    fd.append('temperature', '0');
+    return groqFetch('audio/transcriptions', { method: 'POST', headers: { Authorization: 'Bearer ' + cfg.key }, body: fd });
+  }
+  const recentEs = [];
+  async function translate(es){
+    const context = recentEs.slice(-3).join('\n');
+    const body = model => JSON.stringify({
+      model, reasoning_effort: 'low', temperature: 0.2, max_completion_tokens: 500,
+      messages: [
+        { role: 'system', content: 'You translate Spanish video subtitles into natural, casual English. Reply with ONLY the English translation of the NEW line, nothing else. Earlier lines are context only; do not translate them. Keep slang natural.' },
+        { role: 'user', content: (context ? 'Earlier lines:\n' + context + '\n\n' : '') + 'NEW line:\n' + es }
+      ]
+    });
+    const init = model => ({ method: 'POST', headers: { Authorization: 'Bearer ' + cfg.key, 'Content-Type': 'application/json' }, body: body(model) });
+    let j;
+    try { j = await groqFetch('chat/completions', init('openai/gpt-oss-120b')); }
+    catch (e) { if (e.status === 401) throw e; j = await groqFetch('chat/completions', init('openai/gpt-oss-20b')); }
+    return (j.choices?.[0]?.message?.content || '').trim();
   }
 
   let seq = 0, inFlight = 0;
@@ -243,10 +265,11 @@
     if (Date.now() < backoffUntil || inFlight >= 4) { pushResult(my, null); return; }
     inFlight++;
     try {
-      const jobs = [callGroq('translations', wav)];
-      if (cfg.showEs) jobs.push(callGroq('transcriptions', wav).catch(() => null));
-      const [en, es] = await Promise.all(jobs);
-      pushResult(my, { en: cleanSegments(en), es: es ? cleanSegments(es) : '' });
+      const es = cleanSegments(await transcribe(wav));
+      if (!es) { pushResult(my, null); return; }
+      const en = await translate(es);
+      recentEs.push(es); if (recentEs.length > 10) recentEs.shift();
+      pushResult(my, { en: en || es, es: cfg.showEs ? es : '' });
       if (running) setStatus('Listening…', 'live');
     } catch (e) {
       pushResult(my, null);
