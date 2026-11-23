@@ -32,6 +32,10 @@
   #meterMark{position:absolute;top:-2px;bottom:-2px;width:2px;background:var(--text);opacity:.6}
   #status{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:55%}
 
+  #stats{font-size:12px;color:var(--dim);margin:6px 2px 0}
+  #banner{margin-top:10px;background:#3a1d1d;border:1px solid var(--stop);color:#ffd9d9;border-radius:12px;
+    padding:12px;font-size:14px;line-height:1.45}
+  #banner b{color:#fff}
   #stage{flex:1;display:flex;flex-direction:column;justify-content:flex-end;min-height:0;margin-top:12px}
   #history{flex:1;overflow-y:auto;min-height:0;padding-bottom:8px;-webkit-overflow-scrolling:touch}
   .line{margin:0 0 14px;font-size:calc(var(--cap-size) * .62);line-height:1.35;color:var(--dim)}
@@ -73,6 +77,9 @@
   <div id="meter"><div id="meterFill"></div><div id="meterMark"></div></div>
   <div id="status">Ready</div>
 </div>
+
+<div id="stats">Clips heard: 0 · Subtitles: 0</div>
+<div id="banner" hidden></div>
 
 <div id="stage">
   <div id="history"></div>
@@ -166,6 +173,12 @@
     $('status').textContent = msg;
     $('dot').className = kind || '';
   }
+  const stats = { clips: 0, subs: 0, last: '' };
+  function renderStats(){
+    $('stats').textContent = 'Clips heard: ' + stats.clips + ' · Subtitles: ' + stats.subs +
+      (stats.last ? ' · Last error: ' + stats.last : '');
+  }
+  function showBanner(html){ $('banner').innerHTML = html; $('banner').hidden = !html; }
 
   // ---------- captions ----------
   let shownSeq = -1;
@@ -175,7 +188,7 @@
     while (pending.has(shownSeq + 1)) {
       shownSeq++;
       const r = pending.get(shownSeq); pending.delete(shownSeq);
-      if (r && r.en) showCaption(r.en, r.es);
+      if (r && r.en) { showCaption(r.en, r.es); stats.subs++; renderStats(); }
     }
   }
   function showCaption(en, es){
@@ -262,6 +275,7 @@
   let seq = 0, inFlight = 0;
   async function sendClip(wav){
     const my = seq++;
+    stats.clips++; renderStats();
     if (Date.now() < backoffUntil || inFlight >= 4) { pushResult(my, null); return; }
     inFlight++;
     try {
@@ -273,6 +287,8 @@
       if (running) setStatus('Listening…', 'live');
     } catch (e) {
       pushResult(my, null);
+      stats.last = e.status ? ('HTTP ' + e.status + (e.detail ? ' ' + e.detail : '')) : ('network: ' + (e.message || e.name));
+      renderStats();
       if (e.status === 401) { setStatus('API key is wrong. Check settings.', 'err'); stop(); $('settings').classList.add('open'); }
       else if (e.status === 429) { backoffUntil = Date.now() + 15000; setStatus('Free limit hit. Pausing 15s…', 'err'); }
       else setStatus(e.status ? ('Error ' + e.status + (e.detail ? ': ' + e.detail : '')) : 'No internet?', 'err');
@@ -353,7 +369,14 @@
       mute = ctx.createGain(); mute.gain.value = 0;
       proc.onaudioprocess = onAudio;
       src.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
-      running = true; backoffUntil = 0;
+      const track = stream.getAudioTracks()[0];
+      if (track) {
+        track.onmute = () => { if (running) { setStatus('iPhone paused the mic', 'err'); showBanner(LEFT_MSG); } };
+        track.onunmute = () => { if (running) setStatus('Listening…', 'live'); };
+        track.onended = () => { if (running) { showBanner(LEFT_MSG); stop(); } };
+      }
+      ctx.onstatechange = () => { if (running && ctx && ctx.state !== 'running') setStatus('Audio paused (' + ctx.state + '). Tap Stop, then Start.', 'err'); };
+      running = true; backoffUntil = 0; showBanner('');
       $('startBtn').textContent = '■ Stop'; $('startBtn').classList.add('on');
       setStatus('Listening…', 'live');
       try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
@@ -378,13 +401,20 @@
 
   $('startBtn').onclick = () => running ? stop() : start();
 
+  const LEFT_MSG = '<b>The mic stopped because you left this page.</b> iPhone turns off the mic on any page that isn\'t on screen. ' +
+    'Keep this page open and put the video in <b>picture-in-picture</b> (the small floating player) instead of switching tabs. ' +
+    'Or play the video on another device (laptop/TV) with the phone next to it.';
+  let wasHidden = false;
   document.addEventListener('visibilitychange', async () => {
     if (!running) return;
-    if (document.hidden) return;
+    if (document.hidden) { wasHidden = true; return; }
     // iOS pauses the mic when this page is hidden; wake things back up
     try { await ctx.resume(); } catch {}
     try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
-    setStatus('Back. Keep this page in front, video in PiP', 'live');
+    if (wasHidden) { showBanner(LEFT_MSG); wasHidden = false; }
+    const live = stream?.getAudioTracks()[0]?.readyState === 'live';
+    if (!live) { stop(); setStatus('Mic was turned off. Tap Start again.', 'err'); }
+    else setStatus('Listening…', 'live');
   });
 })();
 </script>
