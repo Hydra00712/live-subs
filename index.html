@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0b0b0f">
+<title>Live Subs</title>
+<style>
+  :root{
+    --bg:#0b0b0f; --panel:#16161d; --line:#2a2a35; --text:#f5f5f7; --dim:#8d8d99;
+    --accent:#ffd23f; --go:#2ecc71; --stop:#ff4d4d; --cap-size:26px;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  body{display:flex;flex-direction:column;
+    padding:calc(env(safe-area-inset-top) + 10px) 16px calc(env(safe-area-inset-bottom) + 12px)}
+  header{display:flex;align-items:center;gap:10px}
+  #startBtn{flex:1;font-size:18px;font-weight:700;border:0;border-radius:14px;padding:14px;
+    background:var(--go);color:#04210f}
+  #startBtn.on{background:var(--stop);color:#fff}
+  .icon-btn{width:52px;height:52px;border-radius:14px;border:1px solid var(--line);
+    background:var(--panel);color:var(--text);font-size:22px}
+  #statusRow{display:flex;align-items:center;gap:10px;margin:10px 2px 0;font-size:13px;color:var(--dim)}
+  #dot{width:10px;height:10px;border-radius:50%;background:#555;flex:none}
+  #dot.live{background:var(--go);box-shadow:0 0 8px var(--go)}
+  #dot.err{background:var(--stop)}
+  #meter{flex:1;height:6px;background:var(--panel);border-radius:3px;overflow:hidden;position:relative}
+  #meterFill{height:100%;width:0;background:var(--dim);transition:width .08s}
+  #meterFill.speech{background:var(--accent)}
+  #meterMark{position:absolute;top:-2px;bottom:-2px;width:2px;background:var(--text);opacity:.6}
+  #status{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:55%}
+
+  #stage{flex:1;display:flex;flex-direction:column;justify-content:flex-end;min-height:0;margin-top:12px}
+  #history{flex:1;overflow-y:auto;min-height:0;padding-bottom:8px;-webkit-overflow-scrolling:touch}
+  .line{margin:0 0 14px;font-size:calc(var(--cap-size) * .62);line-height:1.35;color:var(--dim)}
+  .line .es{display:block;font-size:.8em;opacity:.75;font-style:italic;margin-top:2px}
+  #caption{background:#000;border:1px solid var(--line);border-radius:16px;padding:16px 16px 18px;
+    min-height:7.5em}
+  #capText{font-size:var(--cap-size);line-height:1.3;font-weight:650;color:#fff;
+    text-shadow:0 1px 2px #000}
+  #capEs{font-size:calc(var(--cap-size) * .6);color:var(--accent);margin-top:8px;font-style:italic}
+  #capText:empty::before{content:attr(data-ph);color:var(--dim);font-weight:400;font-size:17px}
+
+  #settings{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:flex-end;z-index:9}
+  #settings.open{display:flex}
+  .sheet{width:100%;max-height:92%;overflow-y:auto;background:var(--panel);border-radius:20px 20px 0 0;
+    padding:20px 16px calc(env(safe-area-inset-bottom) + 20px)}
+  .sheet h2{margin:0 0 14px;font-size:20px}
+  .field{margin-bottom:18px}
+  .field label{display:block;font-size:14px;font-weight:600;margin-bottom:6px}
+  .field small{display:block;color:var(--dim);font-size:12px;margin-top:5px;line-height:1.4}
+  .field input[type=password],.field input[type=text]{width:100%;font-size:16px;padding:12px;border-radius:10px;
+    border:1px solid var(--line);background:var(--bg);color:var(--text)}
+  .field input[type=range]{width:100%}
+  .row{display:flex;justify-content:space-between;align-items:center}
+  .sheet a{color:var(--accent)}
+  .sheet button.done{width:100%;padding:14px;border:0;border-radius:12px;background:var(--accent);
+    color:#111;font-weight:700;font-size:16px}
+  .help{font-size:13px;color:var(--dim);line-height:1.5;background:var(--bg);border-radius:10px;padding:12px;margin-bottom:18px}
+  .help b{color:var(--text)}
+</style>
+</head>
+<body>
+<header>
+  <button id="startBtn">▶ Start subtitles</button>
+  <button id="clearBtn" class="icon-btn" aria-label="Clear">🗑</button>
+  <button id="gearBtn" class="icon-btn" aria-label="Settings">⚙︎</button>
+</header>
+<div id="statusRow">
+  <div id="dot"></div>
+  <div id="meter"><div id="meterFill"></div><div id="meterMark"></div></div>
+  <div id="status">Ready</div>
+</div>
+
+<div id="stage">
+  <div id="history"></div>
+  <div id="caption">
+    <div id="capText" data-ph="Press Start, then play your Spanish video out loud (not in headphones)."></div>
+    <div id="capEs"></div>
+  </div>
+</div>
+
+<div id="settings">
+  <div class="sheet">
+    <h2>Settings</h2>
+    <div class="help">
+      <b>How to use:</b> keep this page open on screen. Play the video in
+      <b>picture-in-picture</b> (the floating mini player) so it sits on top of this page, with the
+      sound coming out of the <b>speaker</b>. This page listens through the mic and shows English subtitles a few seconds behind.
+    </div>
+    <div class="field">
+      <label for="key">Groq API key</label>
+      <input id="key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="gsk_...">
+      <small>Free. Sign up at <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a> → Create API Key → paste it here. It's saved only on this phone.</small>
+    </div>
+    <div class="field">
+      <div class="row"><label for="showEs">Also show the Spanish</label><input id="showEs" type="checkbox"></div>
+      <small>Shows the original Spanish under the English. Handy for learning, but uses twice as many requests.</small>
+    </div>
+    <div class="field">
+      <label for="size">Text size: <span id="sizeVal"></span>px</label>
+      <input id="size" type="range" min="16" max="44" step="1">
+    </div>
+    <div class="field">
+      <label for="maxLen">Delay: <span id="maxLenVal"></span>s</label>
+      <input id="maxLen" type="range" min="3" max="10" step="1">
+      <small>Shorter means faster subtitles but more cut-off sentences. Longer is more accurate. 5–6 works well.</small>
+    </div>
+    <div class="field">
+      <label for="sens">Mic sensitivity: <span id="sensVal"></span></label>
+      <input id="sens" type="range" min="1" max="10" step="1">
+      <small>If the bar never turns yellow when people talk, turn this up. If silence or music keeps getting subtitled, turn it down.</small>
+    </div>
+    <button class="done" id="doneBtn">Done</button>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const API = 'https://api.groq.com/openai/v1/audio/';
+  const TARGET_SR = 16000;
+
+  // ---------- settings (per-phone, browser storage) ----------
+  const store = {
+    get(k, d){ try { const v = localStorage.getItem('ls_' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+    set(k, v){ try { localStorage.setItem('ls_' + k, JSON.stringify(v)); } catch {} }
+  };
+  const cfg = {
+    key: store.get('key', ''),
+    showEs: store.get('showEs', false),
+    size: store.get('size', 26),
+    maxLen: store.get('maxLen', 6),
+    sens: store.get('sens', 5),
+  };
+  const threshold = () => 0.045 / Math.pow(1.45, cfg.sens - 1); // sens 1 → .045, 10 → ~.0016
+
+  function applySettingsUI(){
+    $('key').value = cfg.key;
+    $('showEs').checked = cfg.showEs;
+    $('size').value = cfg.size; $('sizeVal').textContent = cfg.size;
+    $('maxLen').value = cfg.maxLen; $('maxLenVal').textContent = cfg.maxLen;
+    $('sens').value = cfg.sens; $('sensVal').textContent = cfg.sens;
+    document.documentElement.style.setProperty('--cap-size', cfg.size + 'px');
+    $('meterMark').style.left = Math.min(100, threshold() / 0.08 * 100) + '%';
+  }
+  function bind(id, k, parse, ev = 'input'){
+    $(id).addEventListener(ev, e => {
+      cfg[k] = parse(e.target); store.set(k, cfg[k]); applySettingsUI();
+    });
+  }
+  bind('key', 'key', t => t.value.trim());
+  bind('showEs', 'showEs', t => t.checked, 'change');
+  bind('size', 'size', t => +t.value);
+  bind('maxLen', 'maxLen', t => +t.value);
+  bind('sens', 'sens', t => +t.value);
+  $('gearBtn').onclick = () => $('settings').classList.add('open');
+  $('doneBtn').onclick = () => $('settings').classList.remove('open');
+  $('settings').onclick = e => { if (e.target.id === 'settings') $('settings').classList.remove('open'); };
+  applySettingsUI();
+
+  // ---------- status ----------
+  function setStatus(msg, kind){
+    $('status').textContent = msg;
+    $('dot').className = kind || '';
+  }
+
+  // ---------- captions ----------
+  let shownSeq = -1;
+  const pending = new Map(); // seq -> {en, es} | null (dropped)
+  function pushResult(seq, res){
+    pending.set(seq, res);
+    while (pending.has(shownSeq + 1)) {
+      shownSeq++;
+      const r = pending.get(shownSeq); pending.delete(shownSeq);
+      if (r && r.en) showCaption(r.en, r.es);
+    }
+  }
+  function showCaption(en, es){
+    const prevEn = $('capText').textContent, prevEs = $('capEs').textContent;
+    if (prevEn) {
+      const p = document.createElement('p'); p.className = 'line';
+      p.textContent = prevEn;
+      if (prevEs) { const s = document.createElement('span'); s.className = 'es'; s.textContent = prevEs; p.appendChild(s); }
+      const h = $('history'); h.appendChild(p);
+      while (h.children.length > 200) h.removeChild(h.firstChild);
+      h.scrollTop = h.scrollHeight;
+    }
+    $('capText').textContent = en;
+    $('capEs').textContent = es || '';
+  }
+  $('clearBtn').onclick = () => { $('history').textContent = ''; $('capText').textContent = ''; $('capEs').textContent = ''; };
+
+  // Whisper sometimes "hears" these in silence or music.
+  const JUNK = [
+    /^[\s.,!?¡¿…-]*$/,
+    /thank(s| you) (so much )?for watching/i,
+    /(please )?(like and )?subscribe/i,
+    /subtit(les|ulos)? (by|made|realizados|por)/i,
+    /amara\.org/i,
+    /^\W*(you|bye|thank you|thanks|okay|oh|music|applause|\[music\]|\(music\))\W*$/i,
+    /^(gracias\.?|¡?gracias por ver!?)$/i,
+  ];
+  const isJunk = t => JUNK.some(r => r.test(t.trim()));
+
+  function cleanSegments(json){
+    if (!json) return '';
+    if (Array.isArray(json.segments)) {
+      return json.segments
+        .filter(s => !(s.no_speech_prob > 0.6 && s.avg_logprob < -0.7))
+        .map(s => (s.text || '').trim())
+        .filter(t => t && !isJunk(t))
+        .join(' ').trim();
+    }
+    const t = (json.text || '').trim();
+    return isJunk(t) ? '' : t;
+  }
+
+  // ---------- Groq calls ----------
+  let backoffUntil = 0;
+  async function callGroq(kind, wav){
+    const fd = new FormData();
+    fd.append('file', wav, 'clip.wav');
+    fd.append('model', kind === 'translations' ? 'whisper-large-v3' : 'whisper-large-v3-turbo');
+    fd.append('response_format', 'verbose_json');
+    fd.append('temperature', '0');
+    if (kind === 'transcriptions') fd.append('language', 'es');
+    const r = await fetch(API + kind, { method: 'POST', headers: { Authorization: 'Bearer ' + cfg.key }, body: fd });
+    if (!r.ok) {
+      const err = new Error('HTTP ' + r.status); err.status = r.status;
+      try { err.detail = (await r.json()).error?.message; } catch {}
+      throw err;
+    }
+    return r.json();
+  }
+
+  let seq = 0, inFlight = 0;
+  async function sendClip(wav){
+    const my = seq++;
+    if (Date.now() < backoffUntil || inFlight >= 4) { pushResult(my, null); return; }
+    inFlight++;
+    try {
+      const jobs = [callGroq('translations', wav)];
+      if (cfg.showEs) jobs.push(callGroq('transcriptions', wav).catch(() => null));
+      const [en, es] = await Promise.all(jobs);
+      pushResult(my, { en: cleanSegments(en), es: es ? cleanSegments(es) : '' });
+      if (running) setStatus('Listening…', 'live');
+    } catch (e) {
+      pushResult(my, null);
+      if (e.status === 401) { setStatus('API key is wrong. Check settings.', 'err'); stop(); $('settings').classList.add('open'); }
+      else if (e.status === 429) { backoffUntil = Date.now() + 15000; setStatus('Free limit hit. Pausing 15s…', 'err'); }
+      else setStatus(e.status ? ('Error ' + e.status + (e.detail ? ': ' + e.detail : '')) : 'No internet?', 'err');
+    } finally { inFlight--; }
+  }
+
+  // ---------- audio → WAV ----------
+  function downsample(chunks, total, inRate){
+    const ratio = inRate / TARGET_SR;
+    const outLen = Math.floor(total / ratio);
+    const flat = new Float32Array(total);
+    let o = 0; for (const c of chunks) { flat.set(c, o); o += c.length; }
+    const out = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const start = Math.floor(i * ratio), end = Math.min(total, Math.floor((i + 1) * ratio));
+      let s = 0, n = 0; for (let j = start; j < end; j++) { s += flat[j]; n++; }
+      out[i] = n ? s / n : 0;
+    }
+    return out;
+  }
+  function toWav(samples){
+    // normalize quiet speaker audio so Whisper hears it clearly
+    let peak = 0; for (let i = 0; i < samples.length; i++) peak = Math.max(peak, Math.abs(samples[i]));
+    const gain = peak > 0 ? Math.min(8, 0.9 / peak) : 1;
+    const buf = new ArrayBuffer(44 + samples.length * 2), v = new DataView(buf);
+    const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    w(0, 'RIFF'); v.setUint32(4, 36 + samples.length * 2, true); w(8, 'WAVE'); w(12, 'fmt ');
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, TARGET_SR, true); v.setUint32(28, TARGET_SR * 2, true);
+    v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, samples.length * 2, true);
+    for (let i = 0, o = 44; i < samples.length; i++, o += 2) {
+      const s = Math.max(-1, Math.min(1, samples[i] * gain));
+      v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+    return new Blob([buf], { type: 'audio/wav' });
+  }
+
+  // ---------- capture + segmentation ----------
+  let running = false, ctx, stream, src, proc, mute, wakeLock;
+  let chunks = [], total = 0, speechMs = 0, silenceMs = 0;
+  const MIN_SEC = 2, SILENCE_CUT_MS = 350, MIN_SPEECH_MS = 300;
+
+  function flush(){
+    if (!total) return;
+    const rate = ctx.sampleRate;
+    if (speechMs >= MIN_SPEECH_MS) sendClip(toWav(downsample(chunks, total, rate)));
+    // keep a tiny tail so words split at a forced cut aren't lost entirely
+    const keep = Math.floor(rate * 0.25), last = chunks[chunks.length - 1];
+    chunks = []; total = 0; speechMs = 0;
+    if (last && silenceMs < SILENCE_CUT_MS) { const t = last.slice(Math.max(0, last.length - keep)); chunks.push(t); total = t.length; }
+  }
+
+  function onAudio(e){
+    const d = new Float32Array(e.inputBuffer.getChannelData(0));
+    let sum = 0; for (let i = 0; i < d.length; i++) sum += d[i] * d[i];
+    const rms = Math.sqrt(sum / d.length), ms = d.length / ctx.sampleRate * 1000;
+    const speaking = rms > threshold();
+    $('meterFill').style.width = Math.min(100, rms / 0.08 * 100) + '%';
+    $('meterFill').className = speaking ? 'speech' : '';
+    if (speaking) { speechMs += ms; silenceMs = 0; } else silenceMs += ms;
+    chunks.push(d); total += d.length;
+    const sec = total / ctx.sampleRate;
+    if (speechMs === 0 && sec > 1) { chunks = []; total = 0; return; } // drop pure silence
+    if ((sec >= MIN_SEC && silenceMs >= SILENCE_CUT_MS) || sec >= cfg.maxLen) flush();
+  }
+
+  async function start(){
+    if (!cfg.key) { $('settings').classList.add('open'); $('key').focus(); setStatus('Add your free Groq key first', 'err'); return; }
+    if (!navigator.mediaDevices?.getUserMedia) { setStatus('Mic not available. Page must be opened over https://', 'err'); return; }
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      ctx = new AC();
+      stream = await navigator.mediaDevices.getUserMedia({ audio: {
+        echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 } });
+      await ctx.resume();
+      src = ctx.createMediaStreamSource(stream);
+      proc = ctx.createScriptProcessor(4096, 1, 1);
+      mute = ctx.createGain(); mute.gain.value = 0;
+      proc.onaudioprocess = onAudio;
+      src.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
+      running = true; backoffUntil = 0;
+      $('startBtn').textContent = '■ Stop'; $('startBtn').classList.add('on');
+      setStatus('Listening…', 'live');
+      try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+    } catch (e) {
+      setStatus(e.name === 'NotAllowedError' ? 'Mic blocked. Allow microphone for this site.' : 'Could not start mic: ' + (e.message || e.name), 'err');
+      stop();
+    }
+  }
+
+  function stop(){
+    running = false;
+    try { proc && (proc.onaudioprocess = null); src?.disconnect(); proc?.disconnect(); mute?.disconnect(); } catch {}
+    stream?.getTracks().forEach(t => t.stop());
+    try { ctx?.close(); } catch {}
+    try { wakeLock?.release(); } catch {}
+    ctx = stream = src = proc = mute = wakeLock = null;
+    chunks = []; total = 0; speechMs = 0; silenceMs = 0;
+    $('startBtn').textContent = '▶ Start subtitles'; $('startBtn').classList.remove('on');
+    $('meterFill').style.width = '0';
+    if ($('dot').className !== 'err') setStatus('Stopped');
+  }
+
+  $('startBtn').onclick = () => running ? stop() : start();
+
+  document.addEventListener('visibilitychange', async () => {
+    if (!running) return;
+    if (document.hidden) return;
+    // iOS pauses the mic when this page is hidden; wake things back up
+    try { await ctx.resume(); } catch {}
+    try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+    setStatus('Back. Keep this page in front, video in PiP', 'live');
+  });
+})();
+</script>
+</body>
+</html>
